@@ -1,11 +1,12 @@
 use std::f64;
-use std::fs::File;
-use std::io::Write;
+use std::vec::Vec;
 
-use serde::Serialize;
+use itertools::izip;
+
+mod io;
 
 
-struct SimulationConfig {
+pub struct SimulationConfig {
     num_points: u32,
     num_iter: u32,
     c: f64,
@@ -51,7 +52,7 @@ impl Node {
 
 /// Stores the values of the derivatives with respect to time at the nodes
 #[allow(non_snake_case)]
-#[derive(Debug, Copy, Clone, Serialize)]
+#[derive(Debug, Copy, Clone)]
 struct DeltNode {
     du: f64,
     dT: f64,
@@ -69,43 +70,87 @@ impl DeltNode {
 }
 
 
-/// Stores the values to be saved to file
+/// Stores the values of the nodes to be saved to file
 #[allow(non_snake_case)]
-#[derive(Debug, Copy, Clone, Serialize)]
-struct OutputValues {
-    /// index of the node
-    i: u32,
-    /// non-dimensional x-position
-    x: f64,
-    /// non-dimensional area
-    A: f64,
-    /// non-dimensional density
-    rho: f64,
-    /// non-dimensional velocity
-    u: f64,
-    /// non-dimensional temperature
-    T: f64,
+pub struct OutputNodeVectors {
+    rho: Vec<f64>,
+    u: Vec<f64>,
+    T: Vec<f64>
 }
 
-impl OutputValues {
-    fn new(node: &Node, idx: u32) -> OutputValues {
-        OutputValues {
-            i: idx,
-            x: node.x,
-            A: node.A,
-            rho: 0.0,
-            u: 0.0,
-            T: 0.0,
+impl OutputNodeVectors {
+    fn new(num_points: usize) -> Self {
+        OutputNodeVectors {
+            rho: vec![0.0; num_points],
+            u: vec![0.0; num_points],
+            T: vec![0.0; num_points],
         }
     }
 
-    fn set_values(&mut self, node: &Node) {
-        self.rho = node.rho;
-        self.u = node.u;
-        self.T = node.T;
+    /// Updates the output vectors with new information from the simulation
+    #[allow(non_snake_case)]
+    fn update(&mut self, nodes: &Vec<Node>) {
+        for (node, rho, u, T) in izip!(nodes, &mut self.rho, &mut self.u, &mut self.T) {
+            *rho = node.rho;
+            *u = node.u;
+            *T = node.T;
+        }
     }
 }
 
+
+/// Stores the values of the residulas of the nodes to be saved to file
+#[allow(non_snake_case)]
+pub struct OutputResidualVectors {
+    drho: Vec<f64>,
+    du: Vec<f64>,
+    dT: Vec<f64>
+}
+
+impl OutputResidualVectors {
+    fn new(num_points: usize) -> Self {
+        OutputResidualVectors {
+            drho: vec![0.0; num_points],
+            du: vec![0.0; num_points],
+            dT: vec![0.0; num_points],
+        }
+    }
+
+    /// Updates the residual vectors with new information from the simulation
+    #[allow(non_snake_case)]
+    fn update(&mut self, delta_nodes: &Vec<DeltNode>, predict_deltas: &Vec<DeltNode>) {
+        for (delta_node, predict_delta, drho, du, dT) in izip!(delta_nodes, predict_deltas, &mut self.drho, &mut self.du, &mut self.dT) {
+            *drho = 0.5*(delta_node.drho + predict_delta.drho);
+            *du= 0.5*(delta_node.du + predict_delta.du);
+            *dT = 0.5*(delta_node.dT + predict_delta.dT);
+        }
+    }
+}
+
+
+/// Stores the constant data for this problem
+#[allow(non_snake_case)]
+pub struct ConstData {
+    x: Vec<f64>,
+    A: Vec<f64>
+}
+
+impl ConstData {
+    #[allow(non_snake_case)]
+    fn new(nodes: &Vec<Node>) -> Self {
+        let n = nodes.len();
+        let mut data = ConstData{
+            x: vec![0.0; n],
+            A: vec![0.0; n]
+        };
+
+        for (node, x, A) in izip!(nodes, &mut data.x, &mut data.A) {
+            *x = node.x;
+            *A = node.A;
+        }
+        data
+    }
+}
 
 
 fn nozzle_area(x: f64) -> f64 {
@@ -119,8 +164,16 @@ fn main() {
         num_points: 31,
         num_iter: 1400,
         c: 0.5,
-        output_frq: 2,
+        output_frq: 10,
     };
+
+    // Start by creating an empty output file
+    io::hdf5_writer::init_hdf5(&config).unwrap();
+
+    // Store the output information in vectors
+    let mut out_node_vecs = OutputNodeVectors::new(config.num_points as usize);
+    let mut out_res_vecs = OutputResidualVectors::new(config.num_points as usize);
+
 
     let gamma = 1.4;
 
@@ -131,9 +184,6 @@ fn main() {
     // Predicted values of the nodes at new time step
     let mut predict_nodes = vec![Node::new(); n];
     let mut predict_deltas = vec![DeltNode::new(); n];
-
-    // output variables
-    let mut output_nodes: Vec<OutputValues> = Vec::new();
 
 
     // We know the boundary conditions:
@@ -164,9 +214,10 @@ fn main() {
         predict_node.A = node.A;
     }
 
-    for (i, node) in nodes.iter().enumerate() {
-        output_nodes.push(OutputValues::new(node, i as u32));
-    }
+    // create the constant data vector and write it to the file
+    let const_data = ConstData::new(&nodes);
+    io::hdf5_writer::write_const_hdf5(&const_data).unwrap();
+
 
     // At this point we know the values of the variables at t = 0
     // so we can continue with the  simulion!
@@ -280,38 +331,12 @@ fn main() {
 
         // save variable values for post-processing
         if i % config.output_frq == 0 {
-            let dir_name =  format!("./output/{}", i);
-            let node_file_name = format!("./output/{}/node", i);
-            let time_file_name = format!("./output/{}/time", i);
-            let residual_file_name = format!("./output/{}/residual", i);
-            std::fs::create_dir_all(dir_name).expect("Unable to create directory");
+            // Update the output vectors
+            out_node_vecs.update(&nodes);
+            out_res_vecs.update(&delta_nodes, &predict_deltas);
 
-            // write the variables values of the nodes to file
-            let mut f = File::create(node_file_name).expect("Unable to create file.");
-            for (output_node, node) in output_nodes.iter_mut().zip(nodes.iter()) {
-                output_node.set_values(node);
-                let json_output = serde_json::to_string(output_node).unwrap();
-                f.write_all(json_output.as_bytes()).expect("Unable to write to file");
-                f.write_all(b"\n").expect("Unable to write to file");
-            }
-
-            // write the time to file
-            let mut f = File::create(time_file_name).expect("Unable to create file.");
-            f.write_all(total_time.to_string().as_bytes()).expect("Unable to write to file");
-
-            // write residual values to file
-            let mut residual = DeltNode::new();
-            let mut f = File::create(residual_file_name).expect("Unable to create file.");
-            for (delta_node, predict_delta) in delta_nodes.iter().zip(predict_deltas.iter()) {
-                residual.drho = 0.5*(delta_node.drho + predict_delta.drho);
-                residual.du = 0.5*(delta_node.du + predict_delta.du);
-                residual.dT = 0.5*(delta_node.dT + predict_delta.dT);
-
-                let json_output = serde_json::to_string(&residual).unwrap();
-                f.write_all(json_output.as_bytes()).expect("Unable to write to file");
-                f.write_all(b"\n").expect("Unable to write to file");
-
-            }
+            let index = i/config.output_frq;
+            io::hdf5_writer::write_to_hdf5(&out_node_vecs, &out_res_vecs, total_time, index as usize).unwrap();
         }
     }
 //     println!("{}", total_time);
